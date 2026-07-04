@@ -133,10 +133,17 @@ def ssh_keygen():
 
 
 def ssh_sign(key, namespace, path):
-    # Not captured: hardware keys prompt for touch/PIN on the terminal.
-    r = subprocess.run([ssh_keygen(), "-Y", "sign", "-f", str(key), "-n", namespace, str(path)])
-    if r.returncode != 0:
+    # Sign via stdin/stdout and write the .sig ourselves: Windows ssh-keygen
+    # cannot create files on UNC paths, and this sidesteps paths entirely.
+    # stderr is left attached to the terminal so hardware-key touch/PIN
+    # prompts remain visible.
+    data = Path(path).read_bytes()
+    r = subprocess.run([ssh_keygen(), "-Y", "sign", "-f", str(key), "-n", namespace, "-"],
+                       input=data, stdout=subprocess.PIPE)
+    if r.returncode != 0 or not r.stdout.startswith(b"-----BEGIN SSH SIGNATURE-----"):
         die(f"signing failed for {path}")
+    with open(str(path) + ".sig", "xb") as f:
+        f.write(r.stdout)
 
 
 def ssh_verify(allowed_signers, identity, namespace, path):
@@ -315,7 +322,11 @@ def cmd_add(args):
     path = numbered_path(entries, seq)
     with open(path, "xb") as f:
         f.write(canon(entry))
-    ssh_sign(signing_key(cfg, args), NS_ENTRY, path)
+    try:
+        ssh_sign(signing_key(cfg, args), NS_ENTRY, path)
+    except SystemExit:
+        path.unlink(missing_ok=True)  # keep the record free of unsigned entries
+        raise
     labels = ([f"note ({len(args.note)} chars)"] if args.note else []) + \
              [f["name"] for f in files]
     print(f"entry {seq}: {', '.join(labels)}")
@@ -348,7 +359,11 @@ def cmd_anchor(args):
     path = numbered_path(anchors, anchor["seq"])
     with open(path, "xb") as f:
         f.write(canon(anchor))
-    ssh_sign(signing_key(cfg, args), NS_ANCHOR, path)
+    try:
+        ssh_sign(signing_key(cfg, args), NS_ANCHOR, path)
+    except SystemExit:
+        path.unlink(missing_ok=True)
+        raise
     print(f"anchor {anchor['seq']}: root {anchor['root'][:16]}… over entries 1..{anchor['entries']}")
 
     if args.no_stamp:
