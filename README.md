@@ -24,7 +24,7 @@ Nothing about a record depends on this tool being installed — see
 ## Quickstart
 
 ```
-python custodian.py init -C <record-dir> --identity anthony --key <path-to-ssh-private-key>
+python custodian.py init -C <record-dir> --identity <yourname> --key <path-to-ssh-private-key>
 python custodian.py add  -C <record-dir> -m "what happened today" notes.md exhibit.pdf --copy
 python custodian.py anchor -C <record-dir>
 python custodian.py verify -C <record-dir>
