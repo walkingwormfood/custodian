@@ -27,6 +27,8 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +41,23 @@ CHUNK = 1 << 20
 def die(msg):
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(2)
+
+
+def unlink_orphan(path):
+    """Remove a just-written entry/anchor whose signing failed. Retry a few
+    times: on a network share the file can stay briefly locked as the
+    ssh-keygen process that read it exits, and an orphaned unsigned file
+    would otherwise wedge the next append."""
+    for delay in (0, 0.2, 0.5, 1.0):
+        if delay:
+            time.sleep(delay)
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except OSError:
+            continue
+    print(f"warning: could not remove unsigned {path.name}; delete it before"
+          f" the next add/anchor or the chain will not extend", file=sys.stderr)
 
 
 def now_utc():
@@ -133,17 +152,36 @@ def ssh_keygen():
 
 
 def ssh_sign(key, namespace, path):
-    # Sign via stdin/stdout and write the .sig ourselves: Windows ssh-keygen
-    # cannot create files on UNC paths, and this sidesteps paths entirely.
-    # stderr is left attached to the terminal so hardware-key touch/PIN
-    # prompts remain visible.
+    # Sign a copy of the file on local disk, then place the .sig into the
+    # record ourselves. Two reasons not to sign the record file directly or
+    # pipe it over stdin:
+    #   * Windows ssh-keygen cannot create the .sig next to a file on a UNC
+    #     path (records commonly live on a network share); a local temp copy
+    #     writes its .sig locally, and Python copies that into the record.
+    #   * verify-required hardware keys need to prompt for a PIN; leaving
+    #     stdin and the terminal attached to ssh-keygen lets the PIN/touch
+    #     prompt work. (An ssh-keygen signature covers file content and the
+    #     namespace, never the path, so a temp copy signs identically.)
     data = Path(path).read_bytes()
-    r = subprocess.run([ssh_keygen(), "-Y", "sign", "-f", str(key), "-n", namespace, "-"],
-                       input=data, stdout=subprocess.PIPE)
-    if r.returncode != 0 or not r.stdout.startswith(b"-----BEGIN SSH SIGNATURE-----"):
-        die(f"signing failed for {path}")
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="custodian-sign-")
+        os.write(fd, data)
+        os.close(fd)
+        r = subprocess.run([ssh_keygen(), "-Y", "sign", "-f", str(key),
+                            "-n", namespace, tmp])
+        sig_path = tmp + ".sig"
+        if r.returncode != 0 or not os.path.exists(sig_path):
+            die(f"signing failed for {path}")
+        sig_bytes = Path(sig_path).read_bytes()
+        os.remove(sig_path)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
+    if not sig_bytes.startswith(b"-----BEGIN SSH SIGNATURE-----"):
+        die(f"signing produced no valid signature for {path}")
     with open(str(path) + ".sig", "xb") as f:
-        f.write(r.stdout)
+        f.write(sig_bytes)
 
 
 def ssh_verify(allowed_signers, identity, namespace, path):
@@ -325,7 +363,7 @@ def cmd_add(args):
     try:
         ssh_sign(signing_key(cfg, args), NS_ENTRY, path)
     except SystemExit:
-        path.unlink(missing_ok=True)  # keep the record free of unsigned entries
+        unlink_orphan(path)  # keep the record free of unsigned entries
         raise
     labels = ([f"note ({len(args.note)} chars)"] if args.note else []) + \
              [f["name"] for f in files]
@@ -362,7 +400,7 @@ def cmd_anchor(args):
     try:
         ssh_sign(signing_key(cfg, args), NS_ANCHOR, path)
     except SystemExit:
-        path.unlink(missing_ok=True)
+        unlink_orphan(path)
         raise
     print(f"anchor {anchor['seq']}: root {anchor['root'][:16]}… over entries 1..{anchor['entries']}")
 
