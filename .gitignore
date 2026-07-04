@@ -1,0 +1,6 @@
+# Never commit a record into the tool repo — records are private data.
+record/
+*.record/
+
+__pycache__/
+*.pyc
